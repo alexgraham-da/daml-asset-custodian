@@ -1,0 +1,188 @@
+module Main where
+
+import DA.Optional
+import Daml.Script
+
+template Asset
+  with
+    issuer : Party
+    owner  : Party
+    custodian : Party
+    name   : Text
+  where
+    ensure name /= ""
+    signatory issuer
+    observer owner
+    controller custodian can
+      Asset_Transfer : ContractId Asset
+        with
+          newOwner : Party
+        do
+          create this with owner = newOwner, custodian = newOwner
+
+    controller owner can
+      Asset_DesignateCustodian : ContractId Asset
+        with
+          newCustodian : Party
+        do
+          create this with custodian = newCustodian
+
+template Organization
+  with
+    owner : Party
+    risk : Party
+    ops : Party
+    traders : [Party]
+  where
+    signatory owner
+    observer risk, ops, traders
+
+    nonconsuming choice ProposeTransfer : ContractId TransferProposal
+      with
+        assetCid : ContractId Asset
+        transferTo : Party
+        trader : Party
+      controller trader
+      do
+        assertMsg "Trader must be part of organization" $ elem trader traders
+        create TransferProposal with org = owner; approvals = [], ..
+
+-- | Internal proposal which is created and must be approved before sending a Transfer Request
+-- to the Custodian
+template TransferProposal
+  with
+    org : Party
+    trader : Party
+    risk : Party
+    ops : Party
+    assetCid : ContractId Asset
+    transferTo : Party
+    approvals : [Party]
+  where
+    signatory org, trader, approvals
+    observer risk, ops
+
+    choice Approve : ContractId TransferProposal
+      with
+        party : Party
+      controller party
+      do
+        assertMsg "approval can only be done by Risk and Ops" $ party == risk || party == ops
+        assertMsg "party already approved" $ notElem party approvals
+
+        create this with approvals = party :: approvals
+
+    controller trader can
+      TransferProposal_CreateRequest : ContractId TransferRequest
+        with
+          custodian : Party
+        do
+          assertMsg "all parties must approve" $ elem risk approvals && elem ops approvals
+          create TransferRequest with ..
+
+-- |Request for a transfer that is sent to the Custodian, who can finalize and perform the transfer
+template TransferRequest
+  with
+    org : Party
+    trader : Party
+    transferTo : Party
+    assetCid : ContractId Asset
+    custodian : Party
+  where
+    signatory org, trader
+
+    controller custodian can
+      TransferRequest_Approve : (ContractId Asset, ContractId Transfer)
+        do
+          asset <- fetch assetCid
+          newAssetCid <- exercise assetCid Asset_Transfer with newOwner = transferTo
+          transferCid <- create Transfer with ..
+          return (newAssetCid, transferCid)
+
+      TransferRequest_Deny : ContractId TransferDenial
+        with
+          reason : Text
+        do
+          asset <- fetch assetCid
+          create TransferDenial with ..
+
+-- |Record of transfer transaction
+template Transfer
+  with
+    org : Party
+    trader : Party
+    transferTo : Party
+    custodian : Party
+  where
+    signatory custodian
+    observer org, trader
+
+-- |Record of transfer denial
+template TransferDenial
+  with
+    org : Party
+    trader : Party
+    asset : Asset
+    custodian : Party
+    transferTo : Party
+    reason : Text
+  where
+    signatory custodian
+    observer org, trader
+
+
+setup : Script ()
+setup = script do
+
+  issuer <- allocatePartyWithHint "Issuer" (PartyIdHint "Issuer")
+
+  organization <- allocatePartyWithHint "Organization" (PartyIdHint "Organization")
+  trader <- allocatePartyWithHint "Trader" (PartyIdHint "Trader")
+  risk <- allocatePartyWithHint "Risk" (PartyIdHint "Risk")
+  ops <- allocatePartyWithHint "Ops" (PartyIdHint "Ops")
+  custodian <- allocatePartyWithHint "Custodian" (PartyIdHint "Custodian")
+
+  bob     <- allocatePartyWithHint "Bob" (PartyIdHint "Bob")
+  charlie <- allocatePartyWithHint "Charlie" (PartyIdHint "Charlie")
+
+  -- Issuer creates an asset and issues it to the organization
+  assetCid <- issuer `submit` createCmd Asset with name = "BTC", owner = organization, ..
+
+  -- The organization using Custodian is set up
+  orgCid <- organization `submit` createCmd Organization with owner = organization, traders = [trader], ..
+
+  -- Trader proposes transfer
+  internalProposalCid <- trader `submit` exerciseCmd orgCid ProposeTransfer with transferTo = bob; ..
+
+  -- !!! Trader cannot approve their own proposal
+  trader `submitMustFail` exerciseCmd internalProposalCid Approve with party = trader
+
+  -- !!! Trader cannot create transfer request until all parties approve
+  trader `submitMustFail` exerciseCmd internalProposalCid TransferProposal_CreateRequest with ..
+
+  -- Risk and Ops accept proposal
+  internalProposalCid <- ops `submit` exerciseCmd internalProposalCid Approve with party = ops
+  internalProposalCid <- risk `submit` exerciseCmd internalProposalCid Approve with party = risk
+
+  -- Trader creates request for transfer
+  requestCid <- trader `submit` exerciseCmd internalProposalCid TransferProposal_CreateRequest with ..
+
+  -- Custodian accepts and submits transaction
+  (assetCid, transferCid) <- custodian `submit` exerciseCmd requestCid TransferRequest_Approve
+
+  -- !!! The organization no longer has visibility on the asset
+  optAsset <- queryContractId organization assetCid
+  assert $ isNone optAsset
+
+  -- !!! Custodian no longer has visibility on the asset
+  optAsset <- queryContractId custodian assetCid
+  assert $ isNone optAsset
+
+  -- Bob is now the new owner of the asset
+  (Some asset) <- queryContractId bob assetCid
+  assert $ asset.owner == bob
+
+  -- Bob transfers to Charlie
+  assetCid <- bob `submit` exerciseCmd assetCid Asset_Transfer with newOwner = charlie
+
+  return ()
